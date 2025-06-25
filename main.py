@@ -7,7 +7,7 @@ import time
 import json
 from typing import List, Dict, Any
 from bs4 import BeautifulSoup
-import openai
+from openai import AsyncOpenAI
 import re
 
 # Initialize LangAPI
@@ -22,7 +22,7 @@ langapi.add_middleware(
 )
 
 # Configure OpenAI
-openai.api_key = os.getenv("OPENAI_API_KEY")
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 class TranslationRequest(BaseModel):
     content: str
@@ -173,7 +173,7 @@ async def translate_chunks_parallel(chunks, source_lang, target_lang):
             try:
                 print(f"Translating chunk {chunk['id']}")
                 
-                response = await openai.ChatCompletion.acreate(
+                response = await client.chat.completions.create(
                     model="gpt-3.5-turbo",
                     messages=[
                         {
