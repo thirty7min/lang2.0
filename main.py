@@ -1,16 +1,28 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
 import os
 import time
 import re
+import uuid
+import json
 from typing import List, Dict, Any, Tuple
 from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
+import logging
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("LangAPI")
 
 # Initialize LangAPI
-langapi = FastAPI(title="LangAPI", version="2.2.0")
+langapi = FastAPI(title="LangAPI", version="2.3.0")
 
 # Enable CORS
 langapi.add_middleware(
@@ -25,6 +37,46 @@ class TranslationRequest(BaseModel):
     sourceLanguage: str = "en"
     targetLanguage: str
 
+class RequestLogger:
+    def __init__(self, request_id: str):
+        self.request_id = request_id
+        self.start_time = time.time()
+        self.logs = []
+        self.chunk_results = []
+    
+    def log(self, message: str, level: str = "INFO"):
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        log_entry = f"[{self.request_id}] {timestamp} | {level} | {message}"
+        self.logs.append(log_entry)
+        logger.info(log_entry)
+    
+    def log_chunk_result(self, chunk_id: int, success: bool, chars: int, processing_time: float, error: str = None):
+        result = {
+            "chunk_id": chunk_id,
+            "success": success,
+            "characters": chars,
+            "processing_time_ms": round(processing_time * 1000, 2),
+            "error": error
+        }
+        self.chunk_results.append(result)
+        
+        status = "✅ SUCCESS" if success else "❌ FAILED"
+        self.log(f"Chunk {chunk_id}: {status} | {chars} chars | {result['processing_time_ms']}ms | {error if error else 'OK'}")
+    
+    def get_summary(self):
+        total_time = time.time() - self.start_time
+        successful_chunks = len([r for r in self.chunk_results if r['success']])
+        failed_chunks = len([r for r in self.chunk_results if not r['success']])
+        
+        return {
+            "request_id": self.request_id,
+            "total_processing_time": round(total_time, 3),
+            "chunks_successful": successful_chunks,
+            "chunks_failed": failed_chunks,
+            "chunk_details": self.chunk_results,
+            "logs": self.logs
+        }
+
 def get_openai_client():
     """Get OpenAI client - initialize when needed"""
     try:
@@ -33,13 +85,12 @@ def get_openai_client():
             return None
         return AsyncOpenAI(api_key=api_key, timeout=60.0)
     except Exception as e:
-        print(f"OpenAI client error: {e}")
+        logger.error(f"OpenAI client error: {e}")
         return None
 
 def clean_translated_html(original_content, translated_content):
     """Clean up translated HTML to remove extra wrapper tags"""
     
-    # Remove common wrapper tags that OpenAI might add
     unwanted_wrappers = [
         r'^<html[^>]*>(.*)</html>$',
         r'^<body[^>]*>(.*)</body>$', 
@@ -49,64 +100,70 @@ def clean_translated_html(original_content, translated_content):
     
     cleaned = translated_content.strip()
     
-    # Remove unwanted wrappers that weren't in original
     for pattern in unwanted_wrappers:
         match = re.match(pattern, cleaned, re.DOTALL | re.IGNORECASE)
         if match and not re.match(pattern, original_content.strip(), re.DOTALL | re.IGNORECASE):
             cleaned = match.group(1).strip()
     
-    # Remove extra whitespace but preserve structure
     cleaned = re.sub(r'\n\s*\n\s*\n', '\n\n', cleaned)
-    
     return cleaned
 
 class SmartHTMLChunker:
     def __init__(self, target_chars=1500):
         self.target_chars = target_chars
     
-    def calculate_optimal_config(self, content_length):
+    def calculate_optimal_config(self, content_length, req_logger):
         """Calculate optimal chunks and parallel processing based on content size"""
         
-        if content_length < 3000:      # Small: ~2 pages
-            return 2, 2   # max_chunks, parallel_limit
-        elif content_length < 8000:    # Medium: ~5 pages
-            return 5, 4
-        elif content_length < 20000:   # Large: ~10 pages  
-            return 10, 6
-        elif content_length < 50000:   # Very large: ~25 pages
-            return 15, 8
-        else:                          # Huge: 25+ pages
-            return 20, 10
+        if content_length < 3000:
+            config = (2, 2, "Small content")
+        elif content_length < 8000:
+            config = (5, 4, "Medium content")
+        elif content_length < 20000:
+            config = (10, 6, "Large content")
+        elif content_length < 50000:
+            config = (15, 8, "Very large content")
+        else:
+            config = (20, 10, "Huge content")
+        
+        max_chunks, parallel_limit, size_category = config
+        req_logger.log(f"Content analysis: {content_length} chars classified as '{size_category}'")
+        req_logger.log(f"Optimization: Max {max_chunks} chunks, {parallel_limit} parallel workers")
+        
+        return max_chunks, parallel_limit
     
-    def find_safe_break_points(self, html_content):
+    def find_safe_break_points(self, html_content, req_logger):
         """Find safe places to break HTML without cutting sentences or breaking layouts"""
         
         safe_break_patterns = [
-            r'</p>\s*<p',                    # Between paragraphs
-            r'</h[1-6]>\s*<',                # After headings
-            r'</li>\s*<li',                  # Between list items
-            r'</ul>\s*<',                    # After unordered lists
-            r'</ol>\s*<',                    # After ordered lists
-            r'</div>\s*</div>\s*<div',       # Between major div sections
-            r'</section>\s*<section',        # Between sections
-            r'</article>\s*<article',        # Between articles
-            r'</td>\s*<td',                  # Between table cells
-            r'</tr>\s*<tr',                  # Between table rows
-            r'</thead>\s*<tbody',            # Between table sections
-            r'</tbody>\s*</table',           # End of tables
-            r'</table>\s*<',                 # After tables
-            r'</blockquote>\s*<',            # After blockquotes
-            r'</pre>\s*<',                   # After code blocks
-            r'</code>\s*<',                  # After inline code
-            r'</ul>\s*</div>\s*<div',        # Between grid columns
-            r'</div>\s*<div\s+class="[^"]*col', # Before new columns
-            r'</div>\s*<div\s+class="[^"]*grid', # Before new grids
+            r'</p>\s*<p',
+            r'</h[1-6]>\s*<',
+            r'</li>\s*<li',
+            r'</ul>\s*<',
+            r'</ol>\s*<',
+            r'</div>\s*</div>\s*<div',
+            r'</section>\s*<section',
+            r'</article>\s*<article',
+            r'</td>\s*<td',
+            r'</tr>\s*<tr',
+            r'</thead>\s*<tbody',
+            r'</tbody>\s*</table',
+            r'</table>\s*<',
+            r'</blockquote>\s*<',
+            r'</pre>\s*<',
+            r'</code>\s*<',
+            r'</ul>\s*</div>\s*<div',
+            r'</div>\s*<div\s+class="[^"]*col',
+            r'</div>\s*<div\s+class="[^"]*grid',
         ]
         
         break_points = [0]
+        pattern_matches = {}
         
         for pattern in safe_break_patterns:
-            for match in re.finditer(pattern, html_content, re.IGNORECASE):
+            matches = list(re.finditer(pattern, html_content, re.IGNORECASE))
+            pattern_matches[pattern] = len(matches)
+            for match in matches:
                 break_point = match.end() - len(match.group().split('<')[-1]) - 1
                 if break_point > 0:
                     break_points.append(break_point)
@@ -114,28 +171,30 @@ class SmartHTMLChunker:
         break_points.append(len(html_content))
         break_points = sorted(list(set(break_points)))
         
-        print(f"Found {len(break_points)} potential break points")
+        req_logger.log(f"Break point analysis: Found {len(break_points)} potential break points")
+        for pattern, count in pattern_matches.items():
+            if count > 0:
+                req_logger.log(f"  Pattern '{pattern[:20]}...': {count} matches")
+        
         return break_points
     
-    def create_smart_chunks(self, html_content):
+    def create_smart_chunks(self, html_content, req_logger):
         """Create adaptive chunks based on content size"""
         
         content_length = len(html_content)
-        max_chunks, parallel_limit = self.calculate_optimal_config(content_length)
-        
-        print(f"Content: {content_length} chars → Max {max_chunks} chunks, {parallel_limit} parallel")
+        max_chunks, parallel_limit = self.calculate_optimal_config(content_length, req_logger)
         
         if content_length <= self.target_chars:
+            req_logger.log("Single chunk strategy: Content fits in one chunk")
             return [{'id': 0, 'content': html_content}], parallel_limit
         
-        break_points = self.find_safe_break_points(html_content)
-        
-        # Calculate ideal chunks based on content and limits
+        break_points = self.find_safe_break_points(html_content, req_logger)
         ideal_chunks = min(max(1, content_length // self.target_chars), max_chunks)
+        
+        req_logger.log(f"Chunking strategy: Creating {ideal_chunks} chunks from {content_length} chars")
         
         chunks = []
         chars_per_chunk = content_length // ideal_chunks
-        
         current_start = 0
         chunk_id = 0
         
@@ -150,6 +209,7 @@ class SmartHTMLChunker:
                     'start': current_start,
                     'end': len(html_content)
                 })
+                req_logger.log(f"Chunk {chunk_id}: {len(chunk_content)} chars (final chunk)")
                 break
             
             best_break = self.find_nearest_safe_break(break_points, ideal_end, current_start)
@@ -162,14 +222,12 @@ class SmartHTMLChunker:
                     'start': current_start,
                     'end': best_break
                 })
+                req_logger.log(f"Chunk {chunk_id}: {len(chunk_content)} chars (pos {current_start}-{best_break})")
                 chunk_id += 1
             
             current_start = best_break
         
-        print(f"Created {len(chunks)} adaptive chunks")
-        for i, chunk in enumerate(chunks):
-            print(f"  Chunk {i}: {len(chunk['content'])} chars")
-        
+        req_logger.log(f"Chunking complete: Created {len(chunks)} chunks, will use {parallel_limit} parallel workers")
         return chunks, parallel_limit
     
     def find_nearest_safe_break(self, break_points, target_position, min_position):
@@ -187,59 +245,91 @@ class SmartHTMLChunker:
 chunker = SmartHTMLChunker(target_chars=1500)
 
 @langapi.post("/api/translate")
-async def translate_content(request: TranslationRequest):
-    """Translate HTML content using adaptive smart chunking"""
-    start_time = time.time()
+async def translate_content(request: TranslationRequest, http_request: Request):
+    """Translate HTML content using adaptive smart chunking with detailed logging"""
+    
+    # Generate unique request ID
+    request_id = str(uuid.uuid4())[:8]
+    req_logger = RequestLogger(request_id)
     
     try:
-        print(f"Translation request: {request.sourceLanguage} → {request.targetLanguage}")
-        print(f"Content length: {len(request.content)} characters")
+        # Log request details
+        client_ip = http_request.client.host if http_request.client else "unknown"
+        req_logger.log(f"🚀 NEW REQUEST | {request.sourceLanguage} → {request.targetLanguage} | IP: {client_ip}")
+        req_logger.log(f"Content length: {len(request.content):,} characters")
         
+        # Get OpenAI client
         client = get_openai_client()
         if not client:
+            req_logger.log("❌ FAILED: OpenAI client not available", "ERROR")
             raise HTTPException(status_code=500, detail="OpenAI client not available - check API key")
         
+        req_logger.log("✅ OpenAI client initialized")
+        
         # Create adaptive chunks
-        chunks, parallel_limit = chunker.create_smart_chunks(request.content)
-        print(f"Processing {len(chunks)} chunks with {parallel_limit} parallel workers")
+        chunking_start = time.time()
+        chunks, parallel_limit = chunker.create_smart_chunks(request.content, req_logger)
+        chunking_time = time.time() - chunking_start
+        req_logger.log(f"⚡ Chunking completed in {chunking_time*1000:.1f}ms")
         
         # Translate with adaptive parallel processing
+        translation_start = time.time()
         translated_chunks = await translate_html_chunks_parallel(
             chunks,
             request.sourceLanguage,
             request.targetLanguage,
             client,
-            parallel_limit
+            parallel_limit,
+            req_logger
         )
+        translation_time = time.time() - translation_start
+        req_logger.log(f"🔄 Translation phase completed in {translation_time:.2f}s")
         
         # Reassemble and clean translated content
-        final_html = reassemble_translated_chunks(translated_chunks, request.content)
+        assembly_start = time.time()
+        final_html = reassemble_translated_chunks(translated_chunks, request.content, req_logger)
+        assembly_time = time.time() - assembly_start
+        req_logger.log(f"🔧 Assembly completed in {assembly_time*1000:.1f}ms")
         
-        processing_time = time.time() - start_time
-        print(f"Translation completed in {processing_time:.2f} seconds")
+        # Generate summary
+        summary = req_logger.get_summary()
+        req_logger.log(f"✅ REQUEST COMPLETE | Total: {summary['total_processing_time']}s | Success: {summary['chunks_successful']}/{len(chunks)}")
         
         return {
             "translatedContent": final_html,
-            "chunksProcessed": len(translated_chunks),
-            "parallelWorkers": parallel_limit,
-            "processingTime": processing_time,
+            "requestId": request_id,
+            "processingStats": {
+                "chunksProcessed": len(translated_chunks),
+                "chunksSuccessful": summary['chunks_successful'],
+                "chunksFailed": summary['chunks_failed'],
+                "parallelWorkers": parallel_limit,
+                "totalProcessingTime": summary['total_processing_time'],
+                "phases": {
+                    "chunking": round(chunking_time * 1000, 1),
+                    "translation": round(translation_time * 1000, 1),
+                    "assembly": round(assembly_time * 1000, 1)
+                }
+            },
+            "chunkDetails": summary['chunk_details'],
             "fromCache": False
         }
         
     except Exception as e:
-        print(f"Translation error: {str(e)}")
+        req_logger.log(f"❌ REQUEST FAILED: {str(e)}", "ERROR")
         raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
 
-async def translate_html_chunks_parallel(chunks, source_lang, target_lang, client, parallel_limit):
-    """Translate HTML chunks with adaptive parallel processing"""
+async def translate_html_chunks_parallel(chunks, source_lang, target_lang, client, parallel_limit, req_logger):
+    """Translate HTML chunks with adaptive parallel processing and detailed logging"""
+    
     semaphore = asyncio.Semaphore(parallel_limit)
+    req_logger.log(f"🔄 Starting parallel translation: {len(chunks)} chunks, {parallel_limit} workers")
     
     async def translate_single_html_chunk(chunk):
+        chunk_start = time.time()
         async with semaphore:
             try:
-                print(f"Translating chunk {chunk['id']} ({len(chunk['content'])} chars)")
+                req_logger.log(f"🔄 Processing chunk {chunk['id']} ({len(chunk['content'])} chars)")
                 
-                # Enhanced prompt to prevent HTML wrapper addition
                 system_prompt = f"""You are an expert HTML translator. Translate from {source_lang} to {target_lang}.
 
 CRITICAL RULES:
@@ -258,48 +348,76 @@ NEVER add wrapper tags around the content.
 
 Return only the translated version with identical structure."""
 
+                api_call_start = time.time()
                 response = await client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": chunk['content']}
                     ],
-                    temperature=0.02,  # Very low temperature for consistency
+                    temperature=0.02,
                     max_tokens=4000
                 )
+                api_call_time = time.time() - api_call_start
                 
                 translated_content = response.choices[0].message.content.strip()
-                
-                # Clean up any unwanted wrapper tags
                 cleaned_content = clean_translated_html(chunk['content'], translated_content)
                 
-                print(f"Chunk {chunk['id']} completed")
+                chunk_time = time.time() - chunk_start
+                req_logger.log_chunk_result(
+                    chunk['id'], 
+                    True, 
+                    len(chunk['content']), 
+                    chunk_time
+                )
+                req_logger.log(f"  API call took {api_call_time*1000:.0f}ms")
                 
                 return {
                     'id': chunk['id'],
                     'original_content': chunk['content'],
                     'translated_content': cleaned_content,
-                    'success': True
+                    'success': True,
+                    'processing_time': chunk_time,
+                    'api_call_time': api_call_time
                 }
                 
             except Exception as e:
-                print(f"Chunk {chunk['id']} failed: {str(e)}")
+                chunk_time = time.time() - chunk_start
+                error_msg = str(e)
+                req_logger.log_chunk_result(
+                    chunk['id'], 
+                    False, 
+                    len(chunk['content']), 
+                    chunk_time, 
+                    error_msg
+                )
+                
                 return {
                     'id': chunk['id'],
                     'original_content': chunk['content'],
                     'translated_content': chunk['content'],
                     'success': False,
-                    'error': str(e)
+                    'error': error_msg,
+                    'processing_time': chunk_time
                 }
     
-    print(f"Starting parallel translation with {parallel_limit} workers")
+    # Execute all translations
     tasks = [translate_single_html_chunk(chunk) for chunk in chunks]
     results = await asyncio.gather(*tasks)
     
+    # Log summary of parallel execution
+    successful = len([r for r in results if r['success']])
+    failed = len([r for r in results if not r['success']])
+    avg_time = sum([r['processing_time'] for r in results]) / len(results)
+    
+    req_logger.log(f"🏁 Parallel execution complete: {successful} success, {failed} failed, avg {avg_time*1000:.0f}ms per chunk")
+    
     return sorted(results, key=lambda x: x['id'])
 
-def reassemble_translated_chunks(translated_chunks, original_content):
+def reassemble_translated_chunks(translated_chunks, original_content, req_logger):
     """Reassemble translated chunks and ensure no extra HTML"""
+    
+    req_logger.log(f"🔧 Reassembling {len(translated_chunks)} chunks")
     
     final_html = ""
     successful_translations = 0
@@ -309,10 +427,16 @@ def reassemble_translated_chunks(translated_chunks, original_content):
         if chunk['success']:
             successful_translations += 1
     
-    # Final cleanup to remove any remaining wrapper issues
+    # Final cleanup
     final_html = clean_translated_html(original_content, final_html)
     
-    print(f"Reassembled {len(translated_chunks)} chunks ({successful_translations} successful)")
+    original_size = len(original_content)
+    final_size = len(final_html)
+    size_change = ((final_size - original_size) / original_size) * 100
+    
+    req_logger.log(f"📊 Assembly stats: {successful_translations}/{len(translated_chunks)} successful")
+    req_logger.log(f"📏 Size change: {original_size:,} → {final_size:,} chars ({size_change:+.1f}%)")
+    
     return final_html
 
 @langapi.get("/health")
@@ -329,13 +453,13 @@ async def root():
     """API information"""
     return {
         "service": "LangAPI",
-        "version": "2.2.0",
-        "description": "Adaptive HTML translation with clean output",
+        "version": "2.3.0",
+        "description": "Adaptive HTML translation with comprehensive logging",
         "features": [
-            "Adaptive chunking based on content size",
-            "Smart parallel processing scaling", 
-            "Clean HTML output without wrapper tags",
-            "Layout-preserving translation"
+            "Detailed request tracking with unique IDs",
+            "Chunk-by-chunk success/failure logging",
+            "Performance timing for all phases",
+            "Adaptive scaling and optimization logs"
         ],
         "endpoints": {
             "translate": "/api/translate",
