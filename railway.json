@@ -4,9 +4,6 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "uvicorn main:langapi --host 0.0.0.0 --port $PORT --reload",
-    "healthcheckPath": "/health",
-    "healthcheckTimeout": 300,
-    "restartPolicyType": "ON_FAILURE"
+    "startCommand": "uvicorn main:langapi --host 0.0.0.0 --port $PORT"
   }
 }
