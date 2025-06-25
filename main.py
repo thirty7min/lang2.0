@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 
 # Initialize LangAPI
-langapi = FastAPI(title="LangAPI", version="1.0.0")
+langapi = FastAPI(title="LangAPI", version="2.0.0")
 
 # Enable CORS
 langapi.add_middleware(
@@ -37,28 +37,34 @@ def get_openai_client():
         return None
 
 class SmartHTMLChunker:
-    def __init__(self, target_chars=2000, max_chunks=10):
+    def __init__(self, target_chars=1500, max_chunks=15):  # Smaller chunks for better precision
         self.target_chars = target_chars
         self.max_chunks = max_chunks
     
     def find_safe_break_points(self, html_content):
-        """Find safe places to break HTML without cutting sentences or code"""
+        """Find safe places to break HTML without cutting sentences or breaking layouts"""
         
-        # Define patterns for safe break points
+        # Enhanced patterns for better layout preservation
         safe_break_patterns = [
-            r'</p>\s*<p',           # Between paragraphs
-            r'</h[1-6]>\s*<',       # After headings
-            r'</li>\s*<li',         # Between list items
-            r'</div>\s*<div',       # Between divs
-            r'</section>\s*<section', # Between sections
-            r'</article>\s*<article', # Between articles
-            r'</td>\s*<td',         # Between table cells
-            r'</tr>\s*<tr',         # Between table rows
-            r'</ul>\s*<',           # After lists
-            r'</ol>\s*<',           # After ordered lists
-            r'</blockquote>\s*<',   # After blockquotes
-            r'</pre>\s*<',          # After code blocks
-            r'</code>\s*<',         # After inline code
+            r'</p>\s*<p',                    # Between paragraphs
+            r'</h[1-6]>\s*<',                # After headings
+            r'</li>\s*<li',                  # Between list items
+            r'</ul>\s*<',                    # After unordered lists
+            r'</ol>\s*<',                    # After ordered lists
+            r'</div>\s*</div>\s*<div',       # Between major div sections
+            r'</section>\s*<section',        # Between sections
+            r'</article>\s*<article',        # Between articles
+            r'</td>\s*<td',                  # Between table cells
+            r'</tr>\s*<tr',                  # Between table rows
+            r'</thead>\s*<tbody',            # Between table sections
+            r'</tbody>\s*</table',           # End of tables
+            r'</table>\s*<',                 # After tables
+            r'</blockquote>\s*<',            # After blockquotes
+            r'</pre>\s*<',                   # After code blocks
+            r'</code>\s*<',                  # After inline code
+            r'</ul>\s*</div>\s*<div',        # Between grid columns
+            r'</div>\s*<div\s+class="[^"]*col', # Before new columns
+            r'</div>\s*<div\s+class="[^"]*grid', # Before new grids
         ]
         
         # Find all potential break points
@@ -66,9 +72,10 @@ class SmartHTMLChunker:
         
         for pattern in safe_break_patterns:
             for match in re.finditer(pattern, html_content, re.IGNORECASE):
-                # Break point is after the closing tag
-                break_point = match.end() - 1  # Before the opening 
-                break_points.append(break_point)
+                # Break point is after the closing tag but before the opening tag
+                break_point = match.end() - len(match.group().split('<')[-1]) - 1
+                if break_point > 0:
+                    break_points.append(break_point)
         
         # Add end of content
         break_points.append(len(html_content))
@@ -80,7 +87,7 @@ class SmartHTMLChunker:
         return break_points
     
     def create_smart_chunks(self, html_content):
-        """Create chunks that respect HTML structure and don't break sentences"""
+        """Create chunks that respect HTML structure and preserve layouts"""
         
         if len(html_content) <= self.target_chars:
             return [{'id': 0, 'content': html_content}]
@@ -116,23 +123,21 @@ class SmartHTMLChunker:
                 break
             
             # Find the best break point near the ideal end
-            best_break = self.find_nearest_safe_break(break_points, ideal_end)
-            
-            # Make sure we don't go backwards or create empty chunks
-            if best_break <= current_start:
-                best_break = current_start + min(chars_per_chunk, len(html_content) - current_start)
+            best_break = self.find_nearest_safe_break(break_points, ideal_end, current_start)
             
             chunk_content = html_content[current_start:best_break]
             
-            chunks.append({
-                'id': chunk_id,
-                'content': chunk_content,
-                'start': current_start,
-                'end': best_break
-            })
+            # Skip empty chunks
+            if len(chunk_content.strip()) > 0:
+                chunks.append({
+                    'id': chunk_id,
+                    'content': chunk_content,
+                    'start': current_start,
+                    'end': best_break
+                })
+                chunk_id += 1
             
             current_start = best_break
-            chunk_id += 1
         
         print(f"Created {len(chunks)} smart HTML chunks")
         for i, chunk in enumerate(chunks):
@@ -140,41 +145,22 @@ class SmartHTMLChunker:
         
         return chunks
     
-    def find_nearest_safe_break(self, break_points, target_position):
-        """Find the break point closest to target position"""
+    def find_nearest_safe_break(self, break_points, target_position, min_position):
+        """Find the best break point near target position"""
         
-        # Find break points near the target
-        candidates = []
-        for bp in break_points:
-            if bp <= target_position + 500:  # Allow some flexibility
-                candidates.append(bp)
+        # Filter break points that are within reasonable range
+        candidates = [bp for bp in break_points 
+                     if min_position + 200 <= bp <= target_position + 800]
         
         if not candidates:
-            return target_position
+            # Fallback to a position that's at least somewhat forward
+            return min(target_position, len(break_points) - 1)
         
-        # Return the closest one to target
+        # Return the one closest to target
         return min(candidates, key=lambda x: abs(x - target_position))
-    
-    def validate_chunks(self, chunks):
-        """Validate that chunks don't have broken HTML"""
-        valid_chunks = []
-        
-        for chunk in chunks:
-            content = chunk['content']
-            
-            # Basic validation: check if we have severely broken HTML
-            open_tags = len(re.findall(r'<[^/][^>]*[^/]>', content))
-            close_tags = len(re.findall(r'</[^>]*>', content))
-            
-            # If tags are very unbalanced, this chunk might be problematic
-            # But we'll still include it since OpenAI can handle some imbalance
-            
-            valid_chunks.append(chunk)
-        
-        return valid_chunks
 
 # Initialize chunker
-chunker = SmartHTMLChunker(target_chars=2000, max_chunks=10)
+chunker = SmartHTMLChunker(target_chars=1500, max_chunks=15)
 
 @langapi.post("/api/translate")
 async def translate_content(request: TranslationRequest):
@@ -192,13 +178,12 @@ async def translate_content(request: TranslationRequest):
         
         # Create smart HTML chunks
         chunks = chunker.create_smart_chunks(request.content)
-        validated_chunks = chunker.validate_chunks(chunks)
         
-        print(f"Processing {len(validated_chunks)} HTML chunks")
+        print(f"Processing {len(chunks)} HTML chunks")
         
         # Translate all chunks in parallel
         translated_chunks = await translate_html_chunks_parallel(
-            validated_chunks,
+            chunks,
             request.sourceLanguage,
             request.targetLanguage,
             client
@@ -222,7 +207,7 @@ async def translate_content(request: TranslationRequest):
         raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
 
 async def translate_html_chunks_parallel(chunks, source_lang, target_lang, client):
-    """Translate HTML chunks in parallel using OpenAI"""
+    """Translate HTML chunks in parallel with layout preservation"""
     semaphore = asyncio.Semaphore(10)
     
     async def translate_single_html_chunk(chunk):
@@ -230,30 +215,54 @@ async def translate_html_chunks_parallel(chunks, source_lang, target_lang, clien
             try:
                 print(f"Translating HTML chunk {chunk['id']}")
                 
-                # Smart prompt for HTML translation
-                system_prompt = f"""You are a professional translator. Translate the following HTML content from {source_lang} to {target_lang}.
+                # Ultra-precise prompt for layout preservation
+                system_prompt = f"""You are an expert HTML translator specializing in preserving CSS layouts and grid structures.
 
-IMPORTANT RULES:
-1. Translate ONLY the visible text content, NOT the HTML tags, attributes, or code
-2. Keep ALL HTML structure exactly the same (tags, attributes, classes, IDs)
-3. Do NOT translate: class names, IDs, URLs, file paths, variable names, or code
-4. Do NOT translate content inside <script>, <style>, <code>, or <pre> tags
-5. Preserve all spacing, indentation, and formatting
-6. Return ONLY the translated HTML, no explanations
+MISSION: Translate from {source_lang} to {target_lang} while maintaining PERFECT HTML structure.
 
-Translate the text content while preserving the complete HTML structure."""
+ABSOLUTE REQUIREMENTS:
+1. PRESERVE EXACT HTML STRUCTURE: Every tag, attribute, class, ID must remain identical
+2. PRESERVE EXACT WHITESPACE: All spaces, tabs, line breaks, indentation must match exactly
+3. PRESERVE CSS LAYOUTS: Grid layouts, flexbox, columns must work identically after translation
+4. TRANSLATE ONLY TEXT CONTENT: Never change HTML tags, CSS classes, or attributes
+5. MAINTAIN ELEMENT RELATIONSHIPS: Parent-child relationships must remain identical
+
+DO NOT TRANSLATE:
+- HTML tags: <div>, <span>, <p>, etc.
+- CSS classes: class="grid", class="mb-4", etc.
+- IDs: id="header", etc.
+- Attributes: data-*, aria-*, etc.
+- URLs, paths, file names
+- Code inside <script>, <style>, <code>, <pre>
+- CSS property values
+- Variable names or technical terms
+
+EXAMPLE:
+Input:  <div class="grid md:grid-cols-2 gap-8"><h3>Display Features</h3><ul><li>6.1-inch screen</li></ul></div>
+Output: <div class="grid md:grid-cols-2 gap-8"><h3>Caratteristiche del Display</h3><ul><li>Schermo da 6,1 pollici</li></ul></div>
+
+Return ONLY the translated HTML with identical structure and formatting."""
 
                 response = await client.chat.completions.create(
-                    model="gpt-3.5-turbo",
+                    model="gpt-4.1-mini",
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": chunk['content']}
                     ],
-                    temperature=0.1,
+                    temperature=0.05,  # Very low temperature for consistency
                     max_tokens=4000
                 )
                 
                 translated_content = response.choices[0].message.content.strip()
+                
+                # Validation: Check if structure is preserved
+                original_structure = self.extract_structure_signature(chunk['content'])
+                translated_structure = self.extract_structure_signature(translated_content)
+                
+                if original_structure != translated_structure:
+                    print(f"Warning: Structure mismatch in chunk {chunk['id']}, using fallback")
+                    # Use original content if structure is broken
+                    translated_content = chunk['content']
                 
                 print(f"Chunk {chunk['id']} translated successfully")
                 
@@ -274,6 +283,14 @@ Translate the text content while preserving the complete HTML structure."""
                     'error': str(e)
                 }
     
+    def extract_structure_signature(self, html_content):
+        """Extract a signature of the HTML structure for validation"""
+        # Remove text content but keep tags and attributes
+        structure = re.sub(r'>[^<]+<', '><', html_content)
+        # Extract just the tags and critical classes
+        tags = re.findall(r'<[^>]+>', structure)
+        return ''.join(tags)
+    
     print(f"Starting parallel translation of {len(chunks)} HTML chunks")
     tasks = [translate_single_html_chunk(chunk) for chunk in chunks]
     results = await asyncio.gather(*tasks)
@@ -284,13 +301,15 @@ Translate the text content while preserving the complete HTML structure."""
 def reassemble_translated_chunks(translated_chunks):
     """Reassemble translated chunks back into complete HTML"""
     
-    # Simply concatenate the translated content in order
     final_html = ""
+    successful_translations = 0
     
     for chunk in translated_chunks:
         final_html += chunk['translated_content']
+        if chunk['success']:
+            successful_translations += 1
     
-    print(f"Reassembled {len(translated_chunks)} chunks into final HTML")
+    print(f"Reassembled {len(translated_chunks)} chunks ({successful_translations} successful)")
     return final_html
 
 @langapi.get("/health")
@@ -308,8 +327,8 @@ async def root():
     """API information"""
     return {
         "service": "LangAPI",
-        "version": "2.0.0",
-        "description": "Smart HTML translation with boundary-aware chunking",
+        "version": "2.1.0",
+        "description": "Layout-preserving HTML translation with smart chunking",
         "endpoints": {
             "translate": "/api/translate",
             "health": "/health"
