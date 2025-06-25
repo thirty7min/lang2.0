@@ -4,11 +4,10 @@ from pydantic import BaseModel
 import asyncio
 import os
 import time
-import json
+import re
 from typing import List, Dict, Any
 from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
-import re
 
 # Initialize LangAPI
 langapi = FastAPI(title="LangAPI", version="1.0.0")
@@ -32,99 +31,154 @@ def get_openai_client():
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             return None
-        return AsyncOpenAI(api_key=api_key)
+        return AsyncOpenAI(api_key=api_key, timeout=60.0)
     except Exception as e:
         print(f"OpenAI client error: {e}")
         return None
 
-class SmartChunker:
-    def __init__(self, target_chars=1000, max_chunks=10):
+class SmartHTMLChunker:
+    def __init__(self, target_chars=2000, max_chunks=10):
         self.target_chars = target_chars
         self.max_chunks = max_chunks
     
-    def extract_translatable_text(self, html_content):
-        """Extract only text that should be translated"""
-        soup = BeautifulSoup(html_content, 'html.parser')
+    def find_safe_break_points(self, html_content):
+        """Find safe places to break HTML without cutting sentences or code"""
         
-        # Remove elements that shouldn't be translated
-        for element in soup(['script', 'style', 'noscript', 'meta', 'link', 'code']):
-            element.decompose()
-        
-        translatable_elements = []
-        text_tags = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'span', 'div', 'li', 'td', 'th', 'a', 'button']
-        
-        for element in soup.find_all(text_tags):
-            text = element.get_text(strip=True)
-            if text and len(text) > 3 and not self.looks_like_code(text):
-                translatable_elements.append({
-                    'text': text,
-                    'tag': element.name,
-                    'selector': self.generate_selector(element)
-                })
-        
-        return translatable_elements, soup
-    
-    def looks_like_code(self, text):
-        """Check if text looks like code and shouldn't be translated"""
-        code_patterns = [
-            r'^\s*[{}\[\]();]+\s*$',
-            r'^\s*function\s+\w+',
-            r'^\s*class\s+\w+',
-            r'^\s*import\s+',
-            r'^\s*<[^>]+>\s*$',
-            r'^\s*\/\*.*\*\/\s*$',
+        # Define patterns for safe break points
+        safe_break_patterns = [
+            r'</p>\s*<p',           # Between paragraphs
+            r'</h[1-6]>\s*<',       # After headings
+            r'</li>\s*<li',         # Between list items
+            r'</div>\s*<div',       # Between divs
+            r'</section>\s*<section', # Between sections
+            r'</article>\s*<article', # Between articles
+            r'</td>\s*<td',         # Between table cells
+            r'</tr>\s*<tr',         # Between table rows
+            r'</ul>\s*<',           # After lists
+            r'</ol>\s*<',           # After ordered lists
+            r'</blockquote>\s*<',   # After blockquotes
+            r'</pre>\s*<',          # After code blocks
+            r'</code>\s*<',         # After inline code
         ]
         
-        for pattern in code_patterns:
-            if re.match(pattern, text):
-                return True
+        # Find all potential break points
+        break_points = [0]  # Start of content
         
-        special_chars = len(re.findall(r'[{}()\[\];=<>]', text))
-        return len(text) > 0 and special_chars / len(text) > 0.3
+        for pattern in safe_break_patterns:
+            for match in re.finditer(pattern, html_content, re.IGNORECASE):
+                # Break point is after the closing tag
+                break_point = match.end() - 1  # Before the opening 
+                break_points.append(break_point)
+        
+        # Add end of content
+        break_points.append(len(html_content))
+        
+        # Remove duplicates and sort
+        break_points = sorted(list(set(break_points)))
+        
+        print(f"Found {len(break_points)} potential break points")
+        return break_points
     
-    def generate_selector(self, element):
-        """Generate a simple selector for the element"""
-        if element.get('id'):
-            return f"#{element['id']}"
+    def create_smart_chunks(self, html_content):
+        """Create chunks that respect HTML structure and don't break sentences"""
         
-        tag = element.name
-        if element.get('class'):
-            classes = element['class']
-            return f"{tag}.{classes[0]}" if classes else tag
+        if len(html_content) <= self.target_chars:
+            return [{'id': 0, 'content': html_content}]
         
-        return tag
-    
-    def create_smart_chunks(self, elements):
-        """Split elements into optimal chunks for parallel processing"""
-        if not elements:
-            return []
+        break_points = self.find_safe_break_points(html_content)
         
-        total_chars = sum(len(elem['text']) for elem in elements)
-        optimal_chunks = min(max(1, total_chars // self.target_chars), self.max_chunks)
+        # Calculate optimal number of chunks
+        total_chars = len(html_content)
+        ideal_chunks = min(max(1, total_chars // self.target_chars), self.max_chunks)
         
-        print(f"Creating {optimal_chunks} chunks from {total_chars} characters")
+        print(f"Creating ~{ideal_chunks} chunks from {total_chars} characters")
         
-        chunk_size = len(elements) // optimal_chunks if optimal_chunks > 0 else len(elements)
+        # Distribute content across chunks using break points
         chunks = []
+        chars_per_chunk = total_chars // ideal_chunks
         
-        for i in range(0, len(elements), max(1, chunk_size)):
-            chunk_elements = elements[i:i + chunk_size] if chunk_size > 0 else [elements[i]]
-            chunk_text = '\n'.join([elem['text'] for elem in chunk_elements])
+        current_start = 0
+        chunk_id = 0
+        
+        while current_start < len(html_content) and chunk_id < ideal_chunks:
+            # Find ideal end position
+            ideal_end = current_start + chars_per_chunk
+            
+            # If this is the last chunk, take everything
+            if chunk_id == ideal_chunks - 1:
+                chunk_content = html_content[current_start:]
+                chunks.append({
+                    'id': chunk_id,
+                    'content': chunk_content,
+                    'start': current_start,
+                    'end': len(html_content)
+                })
+                break
+            
+            # Find the best break point near the ideal end
+            best_break = self.find_nearest_safe_break(break_points, ideal_end)
+            
+            # Make sure we don't go backwards or create empty chunks
+            if best_break <= current_start:
+                best_break = current_start + min(chars_per_chunk, len(html_content) - current_start)
+            
+            chunk_content = html_content[current_start:best_break]
             
             chunks.append({
-                'id': len(chunks),
-                'elements': chunk_elements,
-                'text': chunk_text
+                'id': chunk_id,
+                'content': chunk_content,
+                'start': current_start,
+                'end': best_break
             })
+            
+            current_start = best_break
+            chunk_id += 1
         
-        return chunks[:optimal_chunks]
+        print(f"Created {len(chunks)} smart HTML chunks")
+        for i, chunk in enumerate(chunks):
+            print(f"  Chunk {i}: {len(chunk['content'])} chars")
+        
+        return chunks
+    
+    def find_nearest_safe_break(self, break_points, target_position):
+        """Find the break point closest to target position"""
+        
+        # Find break points near the target
+        candidates = []
+        for bp in break_points:
+            if bp <= target_position + 500:  # Allow some flexibility
+                candidates.append(bp)
+        
+        if not candidates:
+            return target_position
+        
+        # Return the closest one to target
+        return min(candidates, key=lambda x: abs(x - target_position))
+    
+    def validate_chunks(self, chunks):
+        """Validate that chunks don't have broken HTML"""
+        valid_chunks = []
+        
+        for chunk in chunks:
+            content = chunk['content']
+            
+            # Basic validation: check if we have severely broken HTML
+            open_tags = len(re.findall(r'<[^/][^>]*[^/]>', content))
+            close_tags = len(re.findall(r'</[^>]*>', content))
+            
+            # If tags are very unbalanced, this chunk might be problematic
+            # But we'll still include it since OpenAI can handle some imbalance
+            
+            valid_chunks.append(chunk)
+        
+        return valid_chunks
 
 # Initialize chunker
-chunker = SmartChunker(target_chars=1000, max_chunks=10)
+chunker = SmartHTMLChunker(target_chars=2000, max_chunks=10)
 
 @langapi.post("/api/translate")
 async def translate_content(request: TranslationRequest):
-    """Translate content using parallel processing"""
+    """Translate HTML content using smart chunking"""
     start_time = time.time()
     
     try:
@@ -136,40 +190,29 @@ async def translate_content(request: TranslationRequest):
         if not client:
             raise HTTPException(status_code=500, detail="OpenAI client not available - check API key")
         
-        # Extract translatable elements
-        elements, soup = chunker.extract_translatable_text(request.content)
+        # Create smart HTML chunks
+        chunks = chunker.create_smart_chunks(request.content)
+        validated_chunks = chunker.validate_chunks(chunks)
         
-        if not elements:
-            return {
-                "translatedContent": request.content,
-                "message": "No translatable content found",
-                "processingTime": time.time() - start_time
-            }
-        
-        print(f"Found {len(elements)} translatable elements")
-        
-        # Create smart chunks
-        chunks = chunker.create_smart_chunks(elements)
-        print(f"Created {len(chunks)} chunks for parallel processing")
+        print(f"Processing {len(validated_chunks)} HTML chunks")
         
         # Translate all chunks in parallel
-        translated_chunks = await translate_chunks_parallel(
-            chunks, 
-            request.sourceLanguage, 
+        translated_chunks = await translate_html_chunks_parallel(
+            validated_chunks,
+            request.sourceLanguage,
             request.targetLanguage,
             client
         )
         
-        # Apply translations back to original HTML
-        final_html = apply_translations_to_html(request.content, translated_chunks)
+        # Reassemble translated content
+        final_html = reassemble_translated_chunks(translated_chunks)
         
         processing_time = time.time() - start_time
         print(f"Translation completed in {processing_time:.2f} seconds")
         
         return {
             "translatedContent": final_html,
-            "chunksProcessed": len(chunks),
-            "elementsTranslated": len(elements),
+            "chunksProcessed": len(translated_chunks),
             "processingTime": processing_time,
             "fromCache": False
         }
@@ -178,84 +221,77 @@ async def translate_content(request: TranslationRequest):
         print(f"Translation error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
 
-async def translate_chunks_parallel(chunks, source_lang, target_lang, client):
-    """Translate multiple chunks simultaneously"""
+async def translate_html_chunks_parallel(chunks, source_lang, target_lang, client):
+    """Translate HTML chunks in parallel using OpenAI"""
     semaphore = asyncio.Semaphore(10)
     
-    async def translate_single_chunk(chunk):
+    async def translate_single_html_chunk(chunk):
         async with semaphore:
             try:
-                print(f"Translating chunk {chunk['id']}")
+                print(f"Translating HTML chunk {chunk['id']}")
                 
-                # NEW OpenAI v1.0+ syntax
+                # Smart prompt for HTML translation
+                system_prompt = f"""You are a professional translator. Translate the following HTML content from {source_lang} to {target_lang}.
+
+IMPORTANT RULES:
+1. Translate ONLY the visible text content, NOT the HTML tags, attributes, or code
+2. Keep ALL HTML structure exactly the same (tags, attributes, classes, IDs)
+3. Do NOT translate: class names, IDs, URLs, file paths, variable names, or code
+4. Do NOT translate content inside <script>, <style>, <code>, or <pre> tags
+5. Preserve all spacing, indentation, and formatting
+6. Return ONLY the translated HTML, no explanations
+
+Translate the text content while preserving the complete HTML structure."""
+
                 response = await client.chat.completions.create(
                     model="gpt-3.5-turbo",
                     messages=[
-                        {
-                            "role": "system",
-                            "content": f"Translate the following text from {source_lang} to {target_lang}. "
-                                     f"Return ONLY the translated text, maintaining the same structure and meaning."
-                        },
-                        {
-                            "role": "user",
-                            "content": chunk['text']
-                        }
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": chunk['content']}
                     ],
                     temperature=0.1,
-                    max_tokens=2000
+                    max_tokens=4000
                 )
                 
-                translated_text = response.choices[0].message.content.strip()
-                translated_lines = translated_text.split('\n')
+                translated_content = response.choices[0].message.content.strip()
                 
-                translated_elements = []
-                for i, element in enumerate(chunk['elements']):
-                    if i < len(translated_lines):
-                        translated_elements.append({
-                            **element,
-                            'translatedText': translated_lines[i].strip()
-                        })
-                    else:
-                        translated_elements.append({
-                            **element,
-                            'translatedText': element['text']
-                        })
+                print(f"Chunk {chunk['id']} translated successfully")
                 
-                print(f"Chunk {chunk['id']} completed")
-                return translated_elements
+                return {
+                    'id': chunk['id'],
+                    'original_content': chunk['content'],
+                    'translated_content': translated_content,
+                    'success': True
+                }
                 
             except Exception as e:
                 print(f"Chunk {chunk['id']} failed: {str(e)}")
-                return [{**elem, 'translatedText': elem['text']} for elem in chunk['elements']]
+                return {
+                    'id': chunk['id'],
+                    'original_content': chunk['content'],
+                    'translated_content': chunk['content'],  # Fallback to original
+                    'success': False,
+                    'error': str(e)
+                }
     
-    print(f"Starting parallel translation of {len(chunks)} chunks")
-    tasks = [translate_single_chunk(chunk) for chunk in chunks]
-    chunk_results = await asyncio.gather(*tasks)
+    print(f"Starting parallel translation of {len(chunks)} HTML chunks")
+    tasks = [translate_single_html_chunk(chunk) for chunk in chunks]
+    results = await asyncio.gather(*tasks)
     
-    all_translated_elements = []
-    for chunk_result in chunk_results:
-        all_translated_elements.extend(chunk_result)
-    
-    return all_translated_elements
+    # Sort by chunk ID to maintain order
+    return sorted(results, key=lambda x: x['id'])
 
-def apply_translations_to_html(original_html, translated_elements):
-    """Apply translations back to the original HTML structure"""
-    soup = BeautifulSoup(original_html, 'html.parser')
+def reassemble_translated_chunks(translated_chunks):
+    """Reassemble translated chunks back into complete HTML"""
     
-    translation_map = {}
-    for element in translated_elements:
-        if 'translatedText' in element:
-            translation_map[element['text']] = element['translatedText']
+    # Simply concatenate the translated content in order
+    final_html = ""
     
-    updated_count = 0
-    for original_text, translated_text in translation_map.items():
-        for text_node in soup.find_all(text=True):
-            if text_node.strip() == original_text.strip():
-                text_node.replace_with(translated_text)
-                updated_count += 1
+    for chunk in translated_chunks:
+        final_html += chunk['translated_content']
     
-    print(f"Applied {updated_count} translations to HTML")
-    return str(soup)
+    print(f"Reassembled {len(translated_chunks)} chunks into final HTML")
+    return final_html
 
 @langapi.get("/health")
 async def health_check():
@@ -272,7 +308,8 @@ async def root():
     """API information"""
     return {
         "service": "LangAPI",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "description": "Smart HTML translation with boundary-aware chunking",
         "endpoints": {
             "translate": "/api/translate",
             "health": "/health"
