@@ -86,12 +86,18 @@ def get_openai_client():
     if _openai_client is None:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
+            logger.error("OpenAI API key not found in environment variables")
             return None
-        _openai_client = AsyncOpenAI(
-            api_key=api_key, 
-            timeout=30.0,  # Reduced timeout
-            max_retries=2   # Reduced retries
-        )
+        try:
+            _openai_client = AsyncOpenAI(
+                api_key=api_key, 
+                timeout=45.0,  # More generous timeout
+                max_retries=1   # Minimal retries for speed
+            )
+            logger.info("OpenAI client initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize OpenAI client: {e}")
+            return None
     return _openai_client
 
 def clean_translated_html(original_content, translated_content):
@@ -177,6 +183,9 @@ class FastHTMLChunker:
             if chunk_id == ideal_chunks - 1:
                 # Last chunk gets remaining content
                 chunk_content = html_content[current_start:]
+                # Ensure chunk isn't too large
+                if len(chunk_content) > 12000:
+                    req_logger.log(f"Warning: Large final chunk ({len(chunk_content)} chars)")
                 chunks.append({'id': chunk_id, 'content': chunk_content})
                 req_logger.log(f"Chunk {chunk_id}: {len(chunk_content)} chars (final)")
                 break
@@ -260,19 +269,31 @@ async def translate_html_chunks_aggressive(chunks, source_lang, target_lang, cli
         async with semaphore:
             start_time = time.time()
             try:
+                # Validate chunk content
+                content = chunk['content'].strip()
+                if not content:
+                    req_logger.log(f"Chunk {chunk['id']}: Empty content, skipping")
+                    return {'id': chunk['id'], 'translated_content': '', 'success': True}
+                
+                # Truncate if too large (OpenAI has token limits)
+                if len(content) > 12000:  # Conservative limit
+                    req_logger.log(f"Chunk {chunk['id']}: Truncating large content ({len(content)} chars)")
+                    content = content[:12000] + "..."
+                
                 # Simplified system prompt for speed
                 system_prompt = f"Translate HTML from {source_lang} to {target_lang}. Keep ALL HTML tags unchanged. Translate only text content. Return identical structure."
                 
-                # Use faster model with optimized settings
+                # Use faster model with validated settings
                 response = await client.chat.completions.create(
-                    model="gpt-3.5-turbo",  # Faster than gpt-4o-mini
+                    model="gpt-3.5-turbo-0125",  # Specific stable version
                     messages=[
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": chunk['content']}
+                        {"role": "user", "content": content}
                     ],
-                    temperature=0,  # Faster with 0 temperature
-                    max_tokens=8000,  # Higher limit for larger chunks
-                    timeout=20  # Aggressive timeout
+                    temperature=0.1,  # Slightly above 0 for stability
+                    max_tokens=4096,  # Conservative token limit
+                    presence_penalty=0,
+                    frequency_penalty=0
                 )
                 
                 translated_content = response.choices[0].message.content.strip()
