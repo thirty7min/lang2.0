@@ -6,7 +6,9 @@ import os
 import time
 import re
 import uuid
-from typing import List, Dict
+import json
+from typing import List, Dict, Any, Tuple
+from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 import logging
 from datetime import datetime
@@ -19,8 +21,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("LangAPI")
 
+# Initialize LangAPI
 langapi = FastAPI(title="LangAPI", version="2.3.0")
 
+# Enable CORS
 langapi.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,29 +37,20 @@ class TranslationRequest(BaseModel):
     sourceLanguage: str = "en"
     targetLanguage: str
 
-class AsyncRequestLogger:
+class RequestLogger:
     def __init__(self, request_id: str):
         self.request_id = request_id
         self.start_time = time.time()
         self.logs = []
         self.chunk_results = []
-        self.queue = asyncio.Queue()
-        self._log_task = asyncio.create_task(self._log_worker())
-
-    async def _log_worker(self):
-        while True:
-            log_entry = await self.queue.get()
-            if log_entry is None:
-                break
-            logger.info(log_entry)
-
-    async def log(self, message: str, level: str = "INFO"):
+    
+    def log(self, message: str, level: str = "INFO"):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         log_entry = f"[{self.request_id}] {timestamp} | {level} | {message}"
         self.logs.append(log_entry)
-        await self.queue.put(log_entry)
-
-    async def log_chunk_result(self, chunk_id: int, success: bool, chars: int, processing_time: float, error: str = None):
+        logger.info(log_entry)
+    
+    def log_chunk_result(self, chunk_id: int, success: bool, chars: int, processing_time: float, error: str = None):
         result = {
             "chunk_id": chunk_id,
             "success": success,
@@ -64,13 +59,15 @@ class AsyncRequestLogger:
             "error": error
         }
         self.chunk_results.append(result)
+        
         status = "✅ SUCCESS" if success else "❌ FAILED"
-        await self.log(f"Chunk {chunk_id}: {status} | {chars} chars | {result['processing_time_ms']}ms | {error if error else 'OK'}")
-
+        self.log(f"Chunk {chunk_id}: {status} | {chars} chars | {result['processing_time_ms']}ms | {error if error else 'OK'}")
+    
     def get_summary(self):
         total_time = time.time() - self.start_time
         successful_chunks = len([r for r in self.chunk_results if r['success']])
         failed_chunks = len([r for r in self.chunk_results if not r['success']])
+        
         return {
             "request_id": self.request_id,
             "total_processing_time": round(total_time, 3),
@@ -80,11 +77,8 @@ class AsyncRequestLogger:
             "logs": self.logs
         }
 
-    async def close(self):
-        await self.queue.put(None)
-        await self._log_task
-
 def get_openai_client():
+    """Get OpenAI client - initialize when needed"""
     try:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -95,25 +89,32 @@ def get_openai_client():
         return None
 
 def clean_translated_html(original_content, translated_content):
+    """Clean up translated HTML to remove extra wrapper tags"""
+    
     unwanted_wrappers = [
         r'^<html[^>]*>(.*)</html>$',
         r'^<body[^>]*>(.*)</body>$', 
         r'^<div[^>]*>(.*)</div>$',
         r'^<p[^>]*>(.*)</p>$'
     ]
+    
     cleaned = translated_content.strip()
+    
     for pattern in unwanted_wrappers:
         match = re.match(pattern, cleaned, re.DOTALL | re.IGNORECASE)
         if match and not re.match(pattern, original_content.strip(), re.DOTALL | re.IGNORECASE):
             cleaned = match.group(1).strip()
+    
     cleaned = re.sub(r'\n\s*\n\s*\n', '\n\n', cleaned)
     return cleaned
 
 class SmartHTMLChunker:
     def __init__(self, target_chars=1500):
         self.target_chars = target_chars
-
-    async def calculate_optimal_config(self, content_length, req_logger):
+    
+    def calculate_optimal_config(self, content_length, req_logger):
+        """Calculate optimal chunks and parallel processing based on content size"""
+        
         if content_length < 3000:
             config = (2, 2, "Small content")
         elif content_length < 8000:
@@ -124,88 +125,176 @@ class SmartHTMLChunker:
             config = (15, 8, "Very large content")
         else:
             config = (20, 10, "Huge content")
+        
         max_chunks, parallel_limit, size_category = config
-        await req_logger.log(f"Content analysis: {content_length} chars classified as '{size_category}'")
-        await req_logger.log(f"Optimization: Max {max_chunks} chunks, {parallel_limit} parallel workers")
+        req_logger.log(f"Content analysis: {content_length} chars classified as '{size_category}'")
+        req_logger.log(f"Optimization: Max {max_chunks} chunks, {parallel_limit} parallel workers")
+        
         return max_chunks, parallel_limit
-
-    async def find_safe_break_points(self, html_content, req_logger):
+    
+    def find_safe_break_points(self, html_content, req_logger):
+        """Find safe places to break HTML without cutting sentences or breaking layouts"""
+        
         safe_break_patterns = [
-            r'</p>\s*<p', r'</h[1-6]>\s*<', r'</li>\s*<li', r'</ul>\s*<', r'</ol>\s*<',
-            r'</div>\s*</div>\s*<div', r'</section>\s*<section', r'</article>\s*<article',
-            r'</td>\s*<td', r'</tr>\s*<tr', r'</thead>\s*<tbody', r'</tbody>\s*</table',
-            r'</table>\s*<', r'</blockquote>\s*<', r'</pre>\s*<', r'</code>\s*<',
-            r'</ul>\s*</div>\s*<div', r'</div>\s*<div\s+class=\"[^\"]*col',
-            r'</div>\s*<div\s+class=\"[^\"]*grid',
+            r'</p>\s*<p',
+            r'</h[1-6]>\s*<',
+            r'</li>\s*<li',
+            r'</ul>\s*<',
+            r'</ol>\s*<',
+            r'</div>\s*</div>\s*<div',
+            r'</section>\s*<section',
+            r'</article>\s*<article',
+            r'</td>\s*<td',
+            r'</tr>\s*<tr',
+            r'</thead>\s*<tbody',
+            r'</tbody>\s*</table',
+            r'</table>\s*<',
+            r'</blockquote>\s*<',
+            r'</pre>\s*<',
+            r'</code>\s*<',
+            r'</ul>\s*</div>\s*<div',
+            r'</div>\s*<div\s+class="[^"]*col',
+            r'</div>\s*<div\s+class="[^"]*grid',
         ]
+        
         break_points = [0]
+        pattern_matches = {}
+        
         for pattern in safe_break_patterns:
             matches = list(re.finditer(pattern, html_content, re.IGNORECASE))
+            pattern_matches[pattern] = len(matches)
             for match in matches:
-                point = match.end() - len(match.group().split('<')[-1]) - 1
-                if point > 0:
-                    break_points.append(point)
+                break_point = match.end() - len(match.group().split('<')[-1]) - 1
+                if break_point > 0:
+                    break_points.append(break_point)
+        
         break_points.append(len(html_content))
-        break_points = sorted(set(break_points))
-        await req_logger.log(f"Break point analysis: Found {len(break_points)} potential break points")
+        break_points = sorted(list(set(break_points)))
+        
+        req_logger.log(f"Break point analysis: Found {len(break_points)} potential break points")
+        for pattern, count in pattern_matches.items():
+            if count > 0:
+                req_logger.log(f"  Pattern '{pattern[:20]}...': {count} matches")
+        
         return break_points
-
-    async def create_smart_chunks(self, html_content, req_logger):
+    
+    def create_smart_chunks(self, html_content, req_logger):
+        """Create adaptive chunks based on content size"""
+        
         content_length = len(html_content)
-        max_chunks, parallel_limit = await self.calculate_optimal_config(content_length, req_logger)
+        max_chunks, parallel_limit = self.calculate_optimal_config(content_length, req_logger)
+        
         if content_length <= self.target_chars:
-            await req_logger.log("Single chunk strategy: Content fits in one chunk")
+            req_logger.log("Single chunk strategy: Content fits in one chunk")
             return [{'id': 0, 'content': html_content}], parallel_limit
-        break_points = await self.find_safe_break_points(html_content, req_logger)
+        
+        break_points = self.find_safe_break_points(html_content, req_logger)
         ideal_chunks = min(max(1, content_length // self.target_chars), max_chunks)
-        await req_logger.log(f"Chunking strategy: Creating {ideal_chunks} chunks from {content_length} chars")
-        chunks, chunk_id, current_start = [], 0, 0
+        
+        req_logger.log(f"Chunking strategy: Creating {ideal_chunks} chunks from {content_length} chars")
+        
+        chunks = []
         chars_per_chunk = content_length // ideal_chunks
+        current_start = 0
+        chunk_id = 0
+        
         while current_start < len(html_content) and chunk_id < ideal_chunks:
             ideal_end = current_start + chars_per_chunk
+            
+            if chunk_id == ideal_chunks - 1:
+                chunk_content = html_content[current_start:]
+                chunks.append({
+                    'id': chunk_id,
+                    'content': chunk_content,
+                    'start': current_start,
+                    'end': len(html_content)
+                })
+                req_logger.log(f"Chunk {chunk_id}: {len(chunk_content)} chars (final chunk)")
+                break
+            
             best_break = self.find_nearest_safe_break(break_points, ideal_end, current_start)
-            chunk_content = html_content[current_start:] if chunk_id == ideal_chunks - 1 else html_content[current_start:best_break]
-            chunks.append({'id': chunk_id, 'content': chunk_content, 'start': current_start, 'end': best_break})
-            await req_logger.log(f"Chunk {chunk_id}: {len(chunk_content)} chars")
-            chunk_id += 1
+            chunk_content = html_content[current_start:best_break]
+            
+            if len(chunk_content.strip()) > 0:
+                chunks.append({
+                    'id': chunk_id,
+                    'content': chunk_content,
+                    'start': current_start,
+                    'end': best_break
+                })
+                req_logger.log(f"Chunk {chunk_id}: {len(chunk_content)} chars (pos {current_start}-{best_break})")
+                chunk_id += 1
+            
             current_start = best_break
-        await req_logger.log(f"Chunking complete: Created {len(chunks)} chunks, using {parallel_limit} workers")
+        
+        req_logger.log(f"Chunking complete: Created {len(chunks)} chunks, will use {parallel_limit} parallel workers")
         return chunks, parallel_limit
-
+    
     def find_nearest_safe_break(self, break_points, target_position, min_position):
-        candidates = [bp for bp in break_points if min_position + 200 <= bp <= target_position + 800]
-        return min(candidates, key=lambda x: abs(x - target_position)) if candidates else target_position
+        """Find the best break point near target position"""
+        
+        candidates = [bp for bp in break_points 
+                     if min_position + 200 <= bp <= target_position + 800]
+        
+        if not candidates:
+            return min(target_position, len(break_points) - 1)
+        
+        return min(candidates, key=lambda x: abs(x - target_position))
 
-chunker = SmartHTMLChunker()
+# Initialize chunker
+chunker = SmartHTMLChunker(target_chars=1500)
 
 @langapi.post("/api/translate")
 async def translate_content(request: TranslationRequest, http_request: Request):
+    """Translate HTML content using adaptive smart chunking with detailed logging"""
+    
+    # Generate unique request ID
     request_id = str(uuid.uuid4())[:8]
-    req_logger = AsyncRequestLogger(request_id)
+    req_logger = RequestLogger(request_id)
+    
     try:
+        # Log request details
         client_ip = http_request.client.host if http_request.client else "unknown"
-        await req_logger.log(f"🚀 NEW REQUEST | {request.sourceLanguage} → {request.targetLanguage} | IP: {client_ip}")
-        await req_logger.log(f"Content length: {len(request.content):,} characters")
+        req_logger.log(f"🚀 NEW REQUEST | {request.sourceLanguage} → {request.targetLanguage} | IP: {client_ip}")
+        req_logger.log(f"Content length: {len(request.content):,} characters")
+        
+        # Get OpenAI client
         client = get_openai_client()
         if not client:
-            await req_logger.log("❌ FAILED: OpenAI client not available", "ERROR")
-            raise HTTPException(status_code=500, detail="OpenAI client not available")
-        await req_logger.log("✅ OpenAI client initialized")
+            req_logger.log("❌ FAILED: OpenAI client not available", "ERROR")
+            raise HTTPException(status_code=500, detail="OpenAI client not available - check API key")
+        
+        req_logger.log("✅ OpenAI client initialized")
+        
+        # Create adaptive chunks
         chunking_start = time.time()
-        chunks, parallel_limit = await chunker.create_smart_chunks(request.content, req_logger)
+        chunks, parallel_limit = chunker.create_smart_chunks(request.content, req_logger)
         chunking_time = time.time() - chunking_start
-        await req_logger.log(f"⚡ Chunking completed in {chunking_time*1000:.1f}ms")
+        req_logger.log(f"⚡ Chunking completed in {chunking_time*1000:.1f}ms")
+        
+        # Translate with adaptive parallel processing
         translation_start = time.time()
-        translated_chunks = await translate_html_chunks_parallel(chunks, request.sourceLanguage, request.targetLanguage, client, parallel_limit, req_logger)
+        translated_chunks = await translate_html_chunks_parallel(
+            chunks,
+            request.sourceLanguage,
+            request.targetLanguage,
+            client,
+            parallel_limit,
+            req_logger
+        )
         translation_time = time.time() - translation_start
-        await req_logger.log(f"🔄 Translation completed in {translation_time:.2f}s")
+        req_logger.log(f"🔄 Translation phase completed in {translation_time:.2f}s")
+        
+        # Reassemble and clean translated content
         assembly_start = time.time()
-        final_html = await reassemble_translated_chunks(translated_chunks, request.content, req_logger)
+        final_html = reassemble_translated_chunks(translated_chunks, request.content, req_logger)
         assembly_time = time.time() - assembly_start
-        await req_logger.log(f"🔧 Assembly completed in {assembly_time*1000:.1f}ms")
+        req_logger.log(f"🔧 Assembly completed in {assembly_time*1000:.1f}ms")
+        
+        # Generate summary
         summary = req_logger.get_summary()
-        await req_logger.log(f"✅ REQUEST COMPLETE | Total: {summary['total_processing_time']}s | Success: {summary['chunks_successful']}/{len(chunks)}")
-        await req_logger.close()
+        req_logger.log(f"✅ REQUEST COMPLETE | Total: {summary['total_processing_time']}s | Success: {summary['chunks_successful']}/{len(chunks)}")
+        
         return {
             "translatedContent": final_html,
             "requestId": request_id,
@@ -224,22 +313,23 @@ async def translate_content(request: TranslationRequest, http_request: Request):
             "chunkDetails": summary['chunk_details'],
             "fromCache": False
         }
-
-except Exception as e:
-    await req_logger.log(f"❌ REQUEST FAILED: {str(e)}", "ERROR")
-    await req_logger.close()
-    raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
+        
+    except Exception as e:
+        req_logger.log(f"❌ REQUEST FAILED: {str(e)}", "ERROR")
+        raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
 
 async def translate_html_chunks_parallel(chunks, source_lang, target_lang, client, parallel_limit, req_logger):
+    """Translate HTML chunks with adaptive parallel processing and detailed logging"""
+    
     semaphore = asyncio.Semaphore(parallel_limit)
-    await req_logger.log(f"🔄 Starting parallel translation: {len(chunks)} chunks, {parallel_limit} workers")
-
+    req_logger.log(f"🔄 Starting parallel translation: {len(chunks)} chunks, {parallel_limit} workers")
+    
     async def translate_single_html_chunk(chunk):
         chunk_start = time.time()
         async with semaphore:
             try:
-                await req_logger.log(f"🔄 Processing chunk {chunk['id']} ({len(chunk['content'])} chars)")
-
+                req_logger.log(f"🔄 Processing chunk {chunk['id']} ({len(chunk['content'])} chars)")
+                
                 system_prompt = f"""You are an expert HTML translator. Translate from {source_lang} to {target_lang}.
 
 CRITICAL RULES:
@@ -269,14 +359,19 @@ Return only the translated version with identical structure."""
                     max_tokens=4000
                 )
                 api_call_time = time.time() - api_call_start
-
+                
                 translated_content = response.choices[0].message.content.strip()
                 cleaned_content = clean_translated_html(chunk['content'], translated_content)
+                
                 chunk_time = time.time() - chunk_start
-
-                await req_logger.log_chunk_result(chunk['id'], True, len(chunk['content']), chunk_time)
-                await req_logger.log(f"  API call took {api_call_time*1000:.0f}ms")
-
+                req_logger.log_chunk_result(
+                    chunk['id'], 
+                    True, 
+                    len(chunk['content']), 
+                    chunk_time
+                )
+                req_logger.log(f"  API call took {api_call_time*1000:.0f}ms")
+                
                 return {
                     'id': chunk['id'],
                     'original_content': chunk['content'],
@@ -285,11 +380,18 @@ Return only the translated version with identical structure."""
                     'processing_time': chunk_time,
                     'api_call_time': api_call_time
                 }
+                
             except Exception as e:
                 chunk_time = time.time() - chunk_start
                 error_msg = str(e)
-                await req_logger.log_chunk_result(chunk['id'], False, len(chunk['content']), chunk_time, error_msg)
-
+                req_logger.log_chunk_result(
+                    chunk['id'], 
+                    False, 
+                    len(chunk['content']), 
+                    chunk_time, 
+                    error_msg
+                )
+                
                 return {
                     'id': chunk['id'],
                     'original_content': chunk['content'],
@@ -298,50 +400,57 @@ Return only the translated version with identical structure."""
                     'error': error_msg,
                     'processing_time': chunk_time
                 }
-
+    
+    # Execute all translations
     tasks = [translate_single_html_chunk(chunk) for chunk in chunks]
     results = await asyncio.gather(*tasks)
-
+    
+    # Log summary of parallel execution
     successful = len([r for r in results if r['success']])
     failed = len([r for r in results if not r['success']])
     avg_time = sum([r['processing_time'] for r in results]) / len(results)
-    await req_logger.log(f"🏁 Parallel execution complete: {successful} success, {failed} failed, avg {avg_time*1000:.0f}ms per chunk")
-
+    
+    req_logger.log(f"🏁 Parallel execution complete: {successful} success, {failed} failed, avg {avg_time*1000:.0f}ms per chunk")
+    
     return sorted(results, key=lambda x: x['id'])
 
-
-async def reassemble_translated_chunks(translated_chunks, original_content, req_logger):
-    await req_logger.log(f"🔧 Reassembling {len(translated_chunks)} chunks")
+def reassemble_translated_chunks(translated_chunks, original_content, req_logger):
+    """Reassemble translated chunks and ensure no extra HTML"""
+    
+    req_logger.log(f"🔧 Reassembling {len(translated_chunks)} chunks")
+    
     final_html = ""
     successful_translations = 0
-
+    
     for chunk in translated_chunks:
         final_html += chunk['translated_content']
         if chunk['success']:
             successful_translations += 1
-
+    
+    # Final cleanup
     final_html = clean_translated_html(original_content, final_html)
-
+    
     original_size = len(original_content)
     final_size = len(final_html)
     size_change = ((final_size - original_size) / original_size) * 100
-
-    await req_logger.log(f"📊 Assembly stats: {successful_translations}/{len(translated_chunks)} successful")
-    await req_logger.log(f"📏 Size change: {original_size:,} → {final_size:,} chars ({size_change:+.1f}%)")
+    
+    req_logger.log(f"📊 Assembly stats: {successful_translations}/{len(translated_chunks)} successful")
+    req_logger.log(f"📏 Size change: {original_size:,} → {final_size:,} chars ({size_change:+.1f}%)")
+    
     return final_html
-
 
 @langapi.get("/health")
 async def health_check():
+    """Service health check"""
     return {
         "status": "healthy",
         "timestamp": time.time(),
         "openai_configured": bool(os.getenv("OPENAI_API_KEY"))
     }
 
-
 @langapi.get("/")
 async def root():
+    """API information"""
     return {
         "service": "LangAPI",
         "version": "2.3.0",
