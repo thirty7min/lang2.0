@@ -21,13 +21,21 @@ langapi.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure OpenAI
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 class TranslationRequest(BaseModel):
     content: str
     sourceLanguage: str = "en"
     targetLanguage: str
+
+def get_openai_client():
+    """Get OpenAI client - initialize when needed"""
+    try:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return None
+        return AsyncOpenAI(api_key=api_key)
+    except Exception as e:
+        print(f"OpenAI client error: {e}")
+        return None
 
 class SmartChunker:
     def __init__(self, target_chars=1000, max_chunks=10):
@@ -96,7 +104,7 @@ class SmartChunker:
         
         print(f"Creating {optimal_chunks} chunks from {total_chars} characters")
         
-        chunk_size = len(elements) // optimal_chunks
+        chunk_size = len(elements) // optimal_chunks if optimal_chunks > 0 else len(elements)
         chunks = []
         
         for i in range(0, len(elements), max(1, chunk_size)):
@@ -123,6 +131,11 @@ async def translate_content(request: TranslationRequest):
         print(f"Translation request: {request.sourceLanguage} → {request.targetLanguage}")
         print(f"Content length: {len(request.content)} characters")
         
+        # Get OpenAI client
+        client = get_openai_client()
+        if not client:
+            raise HTTPException(status_code=500, detail="OpenAI client not available - check API key")
+        
         # Extract translatable elements
         elements, soup = chunker.extract_translatable_text(request.content)
         
@@ -143,7 +156,8 @@ async def translate_content(request: TranslationRequest):
         translated_chunks = await translate_chunks_parallel(
             chunks, 
             request.sourceLanguage, 
-            request.targetLanguage
+            request.targetLanguage,
+            client
         )
         
         # Apply translations back to original HTML
@@ -164,7 +178,7 @@ async def translate_content(request: TranslationRequest):
         print(f"Translation error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
 
-async def translate_chunks_parallel(chunks, source_lang, target_lang):
+async def translate_chunks_parallel(chunks, source_lang, target_lang, client):
     """Translate multiple chunks simultaneously"""
     semaphore = asyncio.Semaphore(10)
     
@@ -173,6 +187,7 @@ async def translate_chunks_parallel(chunks, source_lang, target_lang):
             try:
                 print(f"Translating chunk {chunk['id']}")
                 
+                # NEW OpenAI v1.0+ syntax
                 response = await client.chat.completions.create(
                     model="gpt-3.5-turbo",
                     messages=[
