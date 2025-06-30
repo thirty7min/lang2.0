@@ -6,14 +6,10 @@ import os
 import time
 import re
 import uuid
-import json
-from typing import List, Dict, Any, Tuple
-from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 import logging
 from datetime import datetime
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
@@ -21,11 +17,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("LangAPI")
 
-# Initialize LangAPI
-langapi = FastAPI(title="LangAPI", version="3.0.0")
+app = FastAPI(title="LangAPI", version="3.0.0")
 
-# Enable CORS
-langapi.add_middleware(
+app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
@@ -41,13 +35,11 @@ class RequestLogger:
     def __init__(self, request_id: str):
         self.request_id = request_id
         self.start_time = time.time()
-        self.logs = []
         self.chunk_results = []
     
     def log(self, message: str, level: str = "INFO"):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         log_entry = f"[{self.request_id}] {timestamp} | {level} | {message}"
-        self.logs.append(log_entry)
         logger.info(log_entry)
     
     def log_chunk_result(self, chunk_id: int, success: bool, chars: int, processing_time: float, error: str = None):
@@ -73,15 +65,12 @@ class RequestLogger:
             "total_processing_time": round(total_time, 3),
             "chunks_successful": successful_chunks,
             "chunks_failed": failed_chunks,
-            "chunk_details": self.chunk_results,
-            "logs": self.logs
+            "chunk_details": self.chunk_results
         }
 
-# Global OpenAI client - initialize once
 _openai_client = None
 
 def get_openai_client():
-    """Get OpenAI client - initialize once and reuse"""
     global _openai_client
     if _openai_client is None:
         api_key = os.getenv("OPENAI_API_KEY")
@@ -101,10 +90,8 @@ def get_openai_client():
     return _openai_client
 
 def clean_translated_html(original_content, translated_content):
-    """Lightweight HTML cleaning"""
     cleaned = translated_content.strip()
     
-    # Only remove obvious wrapper tags that weren't in original
     if not original_content.strip().startswith('<html') and cleaned.startswith('<html'):
         cleaned = re.sub(r'^<html[^>]*>(.*)</html>$', r'\1', cleaned, flags=re.DOTALL)
     if not original_content.strip().startswith('<body') and cleaned.startswith('<body'):
@@ -118,8 +105,6 @@ class FastHTMLChunker:
         self.max_chunks = 15
         
     def calculate_optimal_config(self, content_length, req_logger):
-        """Aggressive optimization for speed"""
-        
         if content_length < 5000:
             config = (1, 5, "Small content")
         elif content_length < 15000:
@@ -136,10 +121,8 @@ class FastHTMLChunker:
         return max_chunks, parallel_limit
     
     def find_fast_break_points(self, html_content):
-        """Fast break point detection - only essential patterns"""
         break_points = [0]
         
-        # Only the most reliable break patterns for speed
         essential_patterns = [
             r'</p>\s*<p',
             r'</div>\s*<div',
@@ -158,17 +141,13 @@ class FastHTMLChunker:
         return sorted(list(set(break_points)))
     
     def create_fast_chunks(self, html_content, req_logger):
-        """Create larger chunks for faster processing"""
-        
         content_length = len(html_content)
         max_chunks, parallel_limit = self.calculate_optimal_config(content_length, req_logger)
         
-        # Skip chunking for small content
         if content_length <= self.target_chars:
             req_logger.log("Single chunk: Content small enough for one request")
             return [{'id': 0, 'content': html_content}], parallel_limit
         
-        # Fast break point detection
         break_points = self.find_fast_break_points(html_content)
         ideal_chunks = min(max(2, content_length // self.target_chars), max_chunks)
         
@@ -180,9 +159,7 @@ class FastHTMLChunker:
         
         for chunk_id in range(ideal_chunks):
             if chunk_id == ideal_chunks - 1:
-                # Last chunk gets remaining content
                 chunk_content = html_content[current_start:]
-                # Ensure chunk isn't too large
                 if len(chunk_content) > 12000:
                     req_logger.log(f"Warning: Large final chunk ({len(chunk_content)} chars)")
                 chunks.append({'id': chunk_id, 'content': chunk_content})
@@ -202,39 +179,30 @@ class FastHTMLChunker:
         return chunks, parallel_limit
     
     def find_nearest_break(self, break_points, target_position, min_position):
-        """Simple nearest break point finder"""
         candidates = [bp for bp in break_points if min_position < bp <= target_position + 1000]
         return min(candidates, key=lambda x: abs(x - target_position)) if candidates else target_position
 
-# Initialize fast chunker
 chunker = FastHTMLChunker()
 
-@langapi.post("/api/translate")
+@app.post("/api/translate")
 async def translate_content(request: TranslationRequest, http_request: Request):
-    """Fast HTML translation with aggressive optimization"""
-    
     request_id = str(uuid.uuid4())[:8]
     req_logger = RequestLogger(request_id)
     
     try:
-        client_ip = http_request.client.host if http_request.client else "unknown"
         req_logger.log(f"🚀 FAST MODE | {request.sourceLanguage} → {request.targetLanguage} | {len(request.content):,} chars")
         
-        # Get client (now cached globally)
         client = get_openai_client()
         if not client:
             raise HTTPException(status_code=500, detail="OpenAI client not available")
         
-        # Fast chunking
         chunks, parallel_limit = chunker.create_fast_chunks(request.content, req_logger)
         
-        # Aggressive parallel translation
         translated_chunks = await translate_html_chunks_aggressive(
             chunks, request.sourceLanguage, request.targetLanguage, 
             client, parallel_limit, req_logger
         )
         
-        # Simple reassembly
         final_html = ''.join([chunk['translated_content'] for chunk in sorted(translated_chunks, key=lambda x: x['id'])])
         final_html = clean_translated_html(request.content, final_html)
         
@@ -258,9 +226,6 @@ async def translate_content(request: TranslationRequest, http_request: Request):
         raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
 
 async def translate_html_chunks_aggressive(chunks, source_lang, target_lang, client, parallel_limit, req_logger):
-    """Aggressive parallel translation for maximum speed"""
-    
-    # High concurrency semaphore
     semaphore = asyncio.Semaphore(parallel_limit)
     req_logger.log(f"⚡ AGGRESSIVE MODE: {len(chunks)} chunks, {parallel_limit} workers")
     
@@ -268,18 +233,15 @@ async def translate_html_chunks_aggressive(chunks, source_lang, target_lang, cli
         async with semaphore:
             start_time = time.time()
             try:
-                # Validate chunk content
                 content = chunk['content'].strip()
                 if not content:
                     req_logger.log(f"Chunk {chunk['id']}: Empty content, skipping")
                     return {'id': chunk['id'], 'translated_content': '', 'success': True}
                 
-                # Truncate if too large (OpenAI has token limits)
-                if len(content) > 12000:  # Conservative limit
+                if len(content) > 12000:
                     req_logger.log(f"Chunk {chunk['id']}: Truncating large content ({len(content)} chars)")
                     content = content[:12000] + "..."
                 
-                # Simplified system prompt for speed
                 system_prompt = f"Translate HTML from {source_lang} to {target_lang}. Keep ALL HTML tags unchanged. Translate only text content. Return identical structure."
                 
                 response = await client.chat.completions.create(
@@ -310,18 +272,15 @@ async def translate_html_chunks_aggressive(chunks, source_lang, target_lang, cli
                 processing_time = time.time() - start_time
                 req_logger.log_chunk_result(chunk['id'], False, len(chunk['content']), processing_time, str(e))
                 
-                # Return original content on failure
                 return {
                     'id': chunk['id'],
                     'translated_content': chunk['content'],
                     'success': False
                 }
     
-    # Execute all translations concurrently
     tasks = [translate_chunk_fast(chunk) for chunk in chunks]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
-    # Handle any exceptions in results
     final_results = []
     for i, result in enumerate(results):
         if isinstance(result, Exception):
@@ -339,7 +298,7 @@ async def translate_html_chunks_aggressive(chunks, source_lang, target_lang, cli
     
     return final_results
 
-@langapi.get("/health")
+@app.get("/health")
 async def health_check():
     return {
         "status": "healthy", 
@@ -347,21 +306,8 @@ async def health_check():
         "openai_ready": bool(get_openai_client())
     }
 
-@langapi.get("/")
-async def root():
-    return {
-        "service": "LangAPI Fast",
-        "version": "3.0.0",
-        "description": "Optimized for sub-10 second HTML translation",
-        "optimizations": [
-            "Larger chunks (4000 chars vs 1500)",
-            "Higher parallelism (up to 30 concurrent)",
-            "Faster model (GPT-3.5-turbo)",
-            "Simplified processing pipeline",
-            "Cached OpenAI client"
-        ]
-    }
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(langapi, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
