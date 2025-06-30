@@ -60,7 +60,7 @@ class RequestLogger:
         }
         self.chunk_results.append(result)
         
-        status = "✅ SUCCESS" if success else "❌ FAILED"
+        status = "Success" if success else "Failed"
         self.log(f"Chunk {chunk_id}: {status} | {chars} chars | {result['processing_time_ms']}ms")
     
     def get_summary(self):
@@ -91,8 +91,8 @@ def get_openai_client():
         try:
             _openai_client = AsyncOpenAI(
                 api_key=api_key, 
-                timeout=45.0,  # More generous timeout
-                max_retries=1   # Minimal retries for speed
+                timeout=45.0,
+                max_retries=1
             )
             logger.info("OpenAI client initialized successfully")
         except Exception as e:
@@ -114,21 +114,20 @@ def clean_translated_html(original_content, translated_content):
 
 class FastHTMLChunker:
     def __init__(self):
-        # Larger chunks = fewer API calls = faster processing
-        self.target_chars = 4000  # Increased from 1500
-        self.max_chunks = 15      # Reduced max chunks
+        self.target_chars = 4000
+        self.max_chunks = 15
         
     def calculate_optimal_config(self, content_length, req_logger):
         """Aggressive optimization for speed"""
         
         if content_length < 5000:
-            config = (1, 5, "Small - no chunking needed")
+            config = (1, 5, "Small content")
         elif content_length < 15000:
-            config = (3, 15, "Medium content")  # Increased parallel limit
+            config = (3, 15, "Medium content")
         elif content_length < 40000:
-            config = (8, 25, "Large content")   # Much higher parallel
+            config = (8, 25, "Large content")
         else:
-            config = (15, 30, "Very large content")  # Max parallel
+            config = (15, 30, "Very large content")
         
         max_chunks, parallel_limit, size_category = config
         req_logger.log(f"Fast mode: {content_length} chars → {size_category}")
@@ -283,15 +282,14 @@ async def translate_html_chunks_aggressive(chunks, source_lang, target_lang, cli
                 # Simplified system prompt for speed
                 system_prompt = f"Translate HTML from {source_lang} to {target_lang}. Keep ALL HTML tags unchanged. Translate only text content. Return identical structure."
                 
-                # Use faster model with validated settings
                 response = await client.chat.completions.create(
-                    model="gpt-3.5-turbo-0125",  # Specific stable version
+                    model="gpt-3.5-turbo-0125",
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": content}
                     ],
-                    temperature=0.1,  # Slightly above 0 for stability
-                    max_tokens=4096,  # Conservative token limit
+                    temperature=0.1,
+                    max_tokens=4096,
                     presence_penalty=0,
                     frequency_penalty=0
                 )
